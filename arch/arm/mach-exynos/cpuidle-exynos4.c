@@ -724,7 +724,7 @@ static int exynos4_enter_core0_lpa(struct cpuidle_device *dev,
 #endif
 
 	if (log_en)
-		pr_info("+++lpa\n");
+		pr_debug("+++lpa\n");
 
 	do_gettimeofday(&before);
 
@@ -814,7 +814,7 @@ early_wakeup:
 	do_gettimeofday(&after);
 
 	if (log_en)
-		pr_info("---lpa\n");
+		pr_debug("---lpa\n");
 
 #ifdef CONFIG_INTERNAL_MODEM_IF
 	gpio_set_value(GPIO_PDA_ACTIVE, 1);
