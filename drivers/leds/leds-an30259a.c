@@ -116,7 +116,7 @@
 #define LED_R_CURRENT		0x28
 #define LED_G_CURRENT		0x28
 #define LED_B_CURRENT		0x28
-#define LED_MAX_CURRENT		0xFF
+#define LED_MAX_CURRENT		0x28
 #define LED_OFF				0x00
 
 #define	MAX_NUM_LEDS	3
