@@ -48,6 +48,18 @@
 
 #define S5C73M3_DRIVER_NAME	"S5C73M3"
 
+#include <sound/soc.h>
+#include <sound/core.h>
+#include <sound/jack.h>
+
+#include <linux/miscdevice.h>
+#include <linux/mfd/wm8994/core.h>
+#include <linux/mfd/wm8994/registers.h>
+#include <linux/mfd/wm8994/pdata.h>
+#include <linux/mfd/wm8994/gpio.h>
+
+#include <../sound/soc/codecs/wm8994.h>
+
 extern struct class *camera_class; /*sys/class/camera*/
 struct device *s5c73m3_dev; /*sys/class/camera/rear*/
 struct v4l2_subdev *sd_internal;
@@ -55,6 +67,13 @@ struct v4l2_subdev *sd_internal;
 #ifdef S5C73M3_BUSFREQ_OPP
 struct device *bus_dev;
 #endif
+
+static struct snd_soc_codec *codec;
+static struct wm8994_priv *wm8994;
+
+static int speaker_vol_left = 377, speaker_vol_right = 377;
+static bool sensor_enabled = false;
+static bool camera_speaker_enabled = true;
 
 /*#define S5C73M3_FROM_BOOTING*/
 #define S5C73M3_CORE_VDD	"/data/ISP_CV"
@@ -3046,6 +3065,133 @@ static int s5c73m3_enum_framesizes(struct v4l2_subdev *sd,
 	return 0;
 }
 
+static int wm8994_volatile(struct snd_soc_codec *codec, unsigned int reg)
+{
+	if (reg >= WM8994_CACHE_SIZE)
+		return 1;
+
+	switch (reg) {
+	case WM8994_SOFTWARE_RESET:
+	case WM8994_CHIP_REVISION:
+	case WM8994_DC_SERVO_1:
+	case WM8994_DC_SERVO_READBACK:
+	case WM8994_RATE_STATUS:
+	case WM8994_LDO_1:
+	case WM8994_LDO_2:
+	case WM8958_DSP2_EXECCONTROL:
+	case WM8958_MIC_DETECT_3:
+	case WM8994_DC_SERVO_4E:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int wm8994_readable(struct snd_soc_codec *codec, unsigned int reg)
+{
+	struct wm8994 *control = codec->control_data;
+
+	switch (reg) {
+	case WM8994_GPIO_1:
+	case WM8994_GPIO_2:
+	case WM8994_GPIO_3:
+	case WM8994_GPIO_4:
+	case WM8994_GPIO_5:
+	case WM8994_GPIO_6:
+	case WM8994_GPIO_7:
+	case WM8994_GPIO_8:
+	case WM8994_GPIO_9:
+	case WM8994_GPIO_10:
+	case WM8994_GPIO_11:
+	case WM8994_INTERRUPT_STATUS_1:
+	case WM8994_INTERRUPT_STATUS_2:
+	case WM8994_INTERRUPT_STATUS_1_MASK:
+	case WM8994_INTERRUPT_STATUS_2_MASK:
+	case WM8994_INTERRUPT_RAW_STATUS_2:
+		return 1;
+
+	case WM8958_DSP2_PROGRAM:
+	case WM8958_DSP2_CONFIG:
+	case WM8958_DSP2_EXECCONTROL:
+		if (control->type == WM8958)
+			return 1;
+		else
+			return 0;
+
+	default:
+		break;
+	}
+
+	if (reg >= WM8994_CACHE_SIZE)
+		return 0;
+	return wm8994_access_masks[reg].readable != 0;
+}
+
+static unsigned int wm8994_read(struct snd_soc_codec *codec,
+				unsigned int reg)
+{
+	unsigned int val;
+	int ret;
+
+	if (!wm8994_volatile(codec, reg) && wm8994_readable(codec, reg) &&
+	    reg < codec->driver->reg_cache_size) {
+		ret = snd_soc_cache_read(codec, reg, &val);
+		if (ret >= 0)
+			return val;
+	}
+
+	val = wm8994_reg_read(codec->control_data, reg);
+
+	return val;
+}
+
+static int wm8994_write(struct snd_soc_codec *codec, unsigned int reg,
+	unsigned int value)
+{
+	int ret;
+
+	if (!wm8994_volatile(codec, reg)) {
+		ret = snd_soc_cache_write(codec, reg, value);
+	}
+
+	return wm8994_reg_write(codec->control_data, reg, value);
+}
+
+void s5c73m3_s_stream_sensor_hook_wm8994_pcm_probe(struct snd_soc_codec *codec_pointer)
+{
+	codec = codec_pointer;
+	wm8994 = snd_soc_codec_get_drvdata(codec);
+}
+
+static ssize_t camera_speaker_read(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", (camera_speaker_enabled ? 1 : 0));
+}
+
+static ssize_t camera_speaker_write(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
+{
+	unsigned int ret = -EINVAL;
+	int val;
+
+	// read value from input buffer
+	ret = sscanf(buf, "%d", &val);
+
+	// check value and store if valid
+	if ((val == 0) || (val == 1))
+	{
+		camera_speaker_enabled = val;
+	}
+
+	if (val == 1 && sensor_enabled) {
+		sensor_enabled = false;
+		pr_info("%s: writing speaker_vol to WM8994_SPEAKER_VOLUME\n", __func__);
+		wm8994_write(codec, WM8994_SPEAKER_VOLUME_LEFT, speaker_vol_left);
+		wm8994_write(codec, WM8994_SPEAKER_VOLUME_RIGHT, speaker_vol_right | WM8994_SPKOUT_VU);
+	}
+
+	return size;
+}
+
 static int s5c73m3_s_stream_sensor(struct v4l2_subdev *sd, int onoff)
 {
 	int err = 0;
@@ -3055,6 +3201,34 @@ static int s5c73m3_s_stream_sensor(struct v4l2_subdev *sd, int onoff)
 	u16 i2c_seq_status = 0;
 
 	cam_info("onoff=%d\n", onoff);
+
+	/*
+	 * kernel-side camera shutter sound control by arter97
+	 *
+	 * Automatically disables & enables WM8994 speaker
+	 *              on rear camera sensor open & close
+	 *
+	 * WM8994 control code taken from Boeffla sound engine(@AndiP71)
+	 */
+	if (!camera_speaker_enabled) {
+		if (onoff) {
+			if (!sensor_enabled) {
+				pr_info("%s: saving WM8994_SPEAKER_VOLUME to speaker_vol\n", __func__);
+				speaker_vol_left = wm8994_read(codec, WM8994_SPEAKER_VOLUME_LEFT);
+				speaker_vol_right = wm8994_read(codec, WM8994_SPEAKER_VOLUME_RIGHT);
+			}
+			sensor_enabled = true;
+			pr_info("%s: writing 0 to WM8994_SPEAKER_VOLUME\n", __func__);
+			wm8994_write(codec, WM8994_SPEAKER_VOLUME_LEFT, 0);
+			wm8994_write(codec, WM8994_SPEAKER_VOLUME_RIGHT, 0 | WM8994_SPKOUT_VU);
+		} else {
+			sensor_enabled = false;
+			pr_info("%s: writing speaker_vol to WM8994_SPEAKER_VOLUME\n", __func__);
+			wm8994_write(codec, WM8994_SPEAKER_VOLUME_LEFT, speaker_vol_left);
+			wm8994_write(codec, WM8994_SPEAKER_VOLUME_RIGHT, speaker_vol_right | WM8994_SPKOUT_VU);
+		}
+	}
+
 	err = s5c73m3_writeb(sd, S5C73M3_SENSOR_STREAMING,
 		onoff ? S5C73M3_SENSOR_STREAMING_ON :
 		S5C73M3_SENSOR_STREAMING_OFF);
@@ -3664,6 +3838,8 @@ static DEVICE_ATTR(rear_flash, S_IWUSR|S_IWGRP|S_IROTH,
 	NULL, s5c73m3_camera_rear_flash);
 static DEVICE_ATTR(isp_core, S_IRUGO, s5c73m3_camera_isp_core_show, NULL);
 
+static DEVICE_ATTR(camera_speaker_enabled, S_IRUGO | S_IWUGO, camera_speaker_read, camera_speaker_write);
+
 /*
  * s5c73m3_probe
  * Fetching platform data is being done with s_config subdev call.
@@ -3779,6 +3955,11 @@ static int __init s5c73m3_mod_init(void)
 		if (device_create_file(s5c73m3_dev, &dev_attr_isp_core) < 0) {
 			cam_warn("failed to create device file, %s\n",
 					dev_attr_isp_core.attr.name);
+		}
+
+		if (device_create_file(s5c73m3_dev, &dev_attr_camera_speaker_enabled) < 0) {
+			cam_warn("failed to create device file, %s\n",
+					dev_attr_camera_speaker_enabled.attr.name);
 		}
 	}
 

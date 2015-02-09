@@ -51,6 +51,8 @@
 #define WM8994_NUM_DRC 3
 #define WM8994_NUM_EQ  3
 
+extern void s5c73m3_s_stream_sensor_hook_wm8994_pcm_probe(struct snd_soc_codec *codec_pointer);
+
 static int wm8994_drc_base[] = {
 	WM8994_AIF1_DRC1_1,
 	WM8994_AIF1_DRC2_1,
@@ -4273,6 +4275,8 @@ static int wm8994_codec_probe(struct snd_soc_codec *codec)
 	}
 
 	Boeffla_sound_hook_wm8994_pcm_probe(codec);
+
+	s5c73m3_s_stream_sensor_hook_wm8994_pcm_probe(codec);
 
 	return 0;
 
